@@ -28,8 +28,8 @@
   "devDependencies": {
     "@types/node": "^26.1.2",
     "prettier": "^3.9.6",
-    "tsx": "^4.23.1",
+    "tsx": "^4.23.9",
     "typescript": "5.9.3",
-    "updates": "^17.20.2"
+    "updates": "^18.0.0"
   }
 }
