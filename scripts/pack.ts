@@ -1,6 +1,7 @@
 #!/usr/bin/env tsx
 
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -14,7 +15,17 @@ interface BinaryConfig {
   releaseBinaryName?: string;
   releaseRepo: string;
   version: string;
+  /** upstream tag prefix, "v" unless the project tags without one (cloudflared) */
+  tagPrefix?: string;
+  license?: string;
   targets: Record<string, string>;
+}
+
+interface ReleaseAssets {
+  /** asset name -> sha256 GitHub computed for the uploaded file */
+  digests: Map<string, string>;
+  /** asset name -> sha256 the maintainers list in the release notes */
+  noted: Map<string, string>;
 }
 
 const REPO_URL = 'git+https://github.com/cameraui/binaries.git';
@@ -62,6 +73,46 @@ async function download(url: string, dest: string): Promise<void> {
   writeFileSync(dest, buffer);
 }
 
+function sha256(file: string): string {
+  return createHash('sha256').update(readFileSync(file)).digest('hex');
+}
+
+async function fetchReleaseAssets(repo: string, version: string): Promise<ReleaseAssets> {
+  const headers: Record<string, string> = { accept: 'application/vnd.github+json' };
+  if (process.env.GITHUB_TOKEN) {
+    headers.authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+  }
+
+  const res = await fetch(`https://api.github.com/repos/${repo}/releases/tags/${version}`, { headers });
+  if (!res.ok) {
+    throw new Error(`Release lookup failed (${res.status}): ${repo}@${version}`);
+  }
+
+  const release = (await res.json()) as { body?: string; assets?: { name: string; digest?: string | null }[] };
+
+  const digests = new Map<string, string>();
+  for (const asset of release.assets ?? []) {
+    const digest = asset.digest?.replace(/^sha256:/, '');
+    if (digest) {
+      digests.set(asset.name, digest.toLowerCase());
+    }
+  }
+
+  const noted = new Map<string, string>();
+  for (const line of (release.body ?? '').split('\n')) {
+    const match = /^\s*([\w.+-]+):\s*([a-f0-9]{64})\s*$/i.exec(line);
+    if (match) {
+      noted.set(match[1], match[2].toLowerCase());
+    }
+  }
+
+  return { digests, noted };
+}
+
+function isArchive(asset: string): boolean {
+  return asset.endsWith('.zip') || asset.endsWith('.tar.gz') || asset.endsWith('.tgz');
+}
+
 function extract(archive: string, into: string): void {
   if (archive.endsWith('.zip')) {
     execFileSync('unzip', ['-o', '-q', archive, '-d', into], {
@@ -95,16 +146,35 @@ function osCpu(target: string): { os: string; cpu: string } {
   return { os: target.slice(0, idx), cpu: target.slice(idx + 1) };
 }
 
-async function packTarget(pkg: string, config: BinaryConfig, version: string, target: string): Promise<string> {
-  const ver = version.replace(/^v/, '');
+// Two independent sources: the digest GitHub computed for the upload, and the
+// hash the maintainers publish in the release notes. The notes may describe the
+// binary inside an archive instead of the archive itself (cloudflared on macOS).
+function verifyChecksums(asset: string, assets: ReleaseAssets, archivePath: string, binaryPath: string): void {
+  const digest = assets.digests.get(asset);
+  if (!digest) {
+    throw new Error(`No sha256 digest published for ${asset}`);
+  }
+
+  const downloaded = sha256(archivePath);
+  if (downloaded !== digest) {
+    throw new Error(`Checksum mismatch for ${asset}: expected ${digest}, got ${downloaded}`);
+  }
+
+  const noted = assets.noted.get(asset);
+  if (noted && noted !== downloaded && noted !== sha256(binaryPath)) {
+    throw new Error(`Release notes checksum for ${asset} matches neither the download nor the extracted binary`);
+  }
+}
+
+async function packTarget(pkg: string, config: BinaryConfig, tag: string, ver: string, target: string, assets: ReleaseAssets): Promise<string> {
   const { os, cpu } = osCpu(target);
   const isWin = os === 'win32';
 
   const outBinary = config.binaryName + (isWin ? '.exe' : '');
   const innerBinary = (config.releaseBinaryName ?? config.binaryName) + (isWin ? '.exe' : '');
 
-  const asset = config.targets[target].replace(/\{tag\}/g, version).replace(/\{ver\}/g, ver);
-  const url = `https://github.com/${config.releaseRepo}/releases/download/${version}/${asset}`;
+  const asset = config.targets[target].replace(/\{tag\}/g, tag).replace(/\{ver\}/g, ver);
+  const url = `https://github.com/${config.releaseRepo}/releases/download/${tag}/${asset}`;
 
   const tmp = mkdtempSync(join(tmpdir(), `pack-${pkg}-${target}-`));
   try {
@@ -114,12 +184,17 @@ async function packTarget(pkg: string, config: BinaryConfig, version: string, ta
 
     console.log(`  ↓ ${asset}`);
     await download(url, archivePath);
-    extract(archivePath, extractDir);
 
-    const binarySrc = findFile(extractDir, [innerBinary]);
-    if (!binarySrc) {
-      throw new Error(`Binary "${innerBinary}" not found inside ${asset}`);
+    let binarySrc: string | undefined = archivePath;
+    if (isArchive(asset)) {
+      extract(archivePath, extractDir);
+      binarySrc = findFile(extractDir, [innerBinary]);
+      if (!binarySrc) {
+        throw new Error(`Binary "${innerBinary}" not found inside ${asset}`);
+      }
     }
+
+    verifyChecksums(asset, assets, archivePath, binarySrc);
 
     const pkgDir = join(ROOT, 'packages', pkg, 'npm', target);
     mkdirSync(pkgDir, { recursive: true });
@@ -138,7 +213,7 @@ async function packTarget(pkg: string, config: BinaryConfig, version: string, ta
       cpu: [cpu],
       main: outBinary,
       files: [outBinary],
-      license: 'MIT',
+      license: config.license ?? 'MIT',
       repository: {
         type: 'git',
         url: REPO_URL,
@@ -172,11 +247,13 @@ async function main(): Promise<void> {
     throw new Error(`packages/${pkg}/package.json is missing the "camerauiBinary" config block`);
   }
 
-  const version = versionOverride ?? config.version;
-  const ver = version.replace(/^v/, '');
+  const ver = (versionOverride ?? config.version).replace(/^v/, '');
+  const tag = `${config.tagPrefix ?? 'v'}${ver}`;
   const targets = target ? [target] : Object.keys(config.targets);
 
-  console.log(`Packing ${pkg} ${version} for: ${targets.join(', ')}`);
+  console.log(`Packing ${pkg} ${tag} for: ${targets.join(', ')}`);
+
+  const assets = await fetchReleaseAssets(config.releaseRepo, tag);
 
   const optionalDependencies: Record<string, string> = {
     ...mainPkg.optionalDependencies,
@@ -185,13 +262,13 @@ async function main(): Promise<void> {
     if (!config.targets[t]) {
       throw new Error(`No asset configured for target "${t}"`);
     }
-    const name = await packTarget(pkg, config, version, t);
+    const name = await packTarget(pkg, config, tag, ver, t, assets);
     optionalDependencies[name] = ver;
   }
 
   // Keep main package.json in sync: version + pinned optional deps + config version.
   mainPkg.version = ver;
-  mainPkg.camerauiBinary = { ...config, version };
+  mainPkg.camerauiBinary = { ...config, version: tag };
   mainPkg.optionalDependencies = Object.fromEntries(Object.entries(optionalDependencies).sort(([a], [b]) => a.localeCompare(b)));
   writeJson(mainPkgPath, mainPkg);
 

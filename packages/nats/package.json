@@ -22,6 +22,7 @@
     "releaseBinaryName": "nats-server",
     "releaseRepo": "nats-io/nats-server",
     "version": "v2.15.0",
+    "license": "Apache-2.0",
     "targets": {
       "darwin-x64": "nats-server-{tag}-darwin-amd64.tar.gz",
       "darwin-arm64": "nats-server-{tag}-darwin-arm64.tar.gz",

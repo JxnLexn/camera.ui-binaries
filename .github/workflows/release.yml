@@ -7,6 +7,7 @@ on:
       - "tunnel-v*"
       - "go2rtc-v*"
       - "nats-v*"
+      - "cloudflared-v*"
   workflow_dispatch:
     inputs:
       package:
@@ -17,6 +18,7 @@ on:
           - tunnel
           - go2rtc
           - nats
+          - cloudflared
       version:
         description: "Release tag to fetch (e.g. v1.0.3). Leave empty to use the version in package.json."
         required: false

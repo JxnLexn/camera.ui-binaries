@@ -9,7 +9,7 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-PACKAGES="tunnel go2rtc nats"
+PACKAGES="tunnel go2rtc nats cloudflared"
 
 usage() {
   cat <<EOF
@@ -93,12 +93,16 @@ fi
 
 echo -e "${CYAN}Releasing $NAME ($DIR): $cur -> $NEW (tag $TAG)${NC}"
 
+# Most projects tag as v<version>; cloudflared tags without the prefix.
+PREFIX="$(node -p "require('./$DIR/package.json').camerauiBinary.tagPrefix ?? 'v'")"
+UPSTREAM_TAG="$PREFIX$NEW"
+
 if [ "$SKIP_CHECKS" = false ]; then
   REPO="$(node -p "require('./$DIR/package.json').camerauiBinary.releaseRepo")"
-  echo -e "${YELLOW}Pre-flight: verifying upstream release $REPO@v$NEW exists...${NC}"
-  status="$(curl -fsS -o /dev/null -w '%{http_code}' "https://api.github.com/repos/$REPO/releases/tags/v$NEW" || true)"
+  echo -e "${YELLOW}Pre-flight: verifying upstream release $REPO@$UPSTREAM_TAG exists...${NC}"
+  status="$(curl -fsS -o /dev/null -w '%{http_code}' "https://api.github.com/repos/$REPO/releases/tags/$UPSTREAM_TAG" || true)"
   if [ "$status" != "200" ]; then
-    echo -e "${RED}Upstream release v$NEW not found at $REPO (HTTP $status). Use --skip-checks to override.${NC}"
+    echo -e "${RED}Upstream release $UPSTREAM_TAG not found at $REPO (HTTP $status). Use --skip-checks to override.${NC}"
     exit 1
   fi
   echo -e "${GREEN}Upstream release found.${NC}"
@@ -110,7 +114,7 @@ node -e "
   const f = './$DIR/package.json';
   const p = require(f);
   p.version = '$NEW';
-  p.camerauiBinary.version = 'v$NEW';
+  p.camerauiBinary.version = '$UPSTREAM_TAG';
   for (const dep of Object.keys(p.optionalDependencies || {})) {
     p.optionalDependencies[dep] = '$NEW';
   }
